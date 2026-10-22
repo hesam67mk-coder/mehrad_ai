@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: mehrad-ai
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATA_DIR
+        value: /data
+    disk:
+      name: mehrad-data
+      mountPath: /data
+      sizeGB: 1

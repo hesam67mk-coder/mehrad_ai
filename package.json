@@ -1,0 +1,9 @@
+{
+  "name": "mehrad-ai",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Persian RTL logo studio based on the supplied Figma design",
+  "engines": { "node": ">=24" },
+  "scripts": { "start": "node server.mjs", "preview": "node preview.mjs", "test": "node --test api.test.mjs", "check": "node --check server.mjs && node --check studio.js && node --check logo.js" }
+}
