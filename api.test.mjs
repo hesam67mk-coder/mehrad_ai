@@ -8,11 +8,14 @@ import {once} from 'node:events';
 import {logoSVG} from './logo.js';
 import http from 'node:http';
 import {DatabaseSync} from 'node:sqlite';
-import {createHash} from 'node:crypto';
+import {createHash,scryptSync} from 'node:crypto';
 let child,dir,base,mailServer,messages=[],failMail=false;
 async function waitFor(check){for(let i=0;i<100;i++){if(check())return;await new Promise(r=>setTimeout(r,20));}throw Error('Timed out waiting for mail');}
 before(async()=>{
   dir=await mkdtemp(join(tmpdir(),'mehrad-test-'));
+  const legacy=new DatabaseSync(join(dir,'mehrad.sqlite'));
+  legacy.exec('CREATE TABLE users(id TEXT PRIMARY KEY,name TEXT NOT NULL,email TEXT NOT NULL UNIQUE,password TEXT NOT NULL)');
+  const salt='legacy-migration-test-salt';legacy.prepare('INSERT INTO users VALUES(?,?,?,?)').run('legacy-user','Legacy User','legacy@example.test',`${salt}:${scryptSync('legacy-test-password',salt,64).toString('hex')}`);legacy.close();
   mailServer=http.createServer(async(req,res)=>{let text='';for await(const chunk of req)text+=chunk;messages.push({body:JSON.parse(text),key:req.headers['idempotency-key']});res.writeHead(failMail?503:200,{'Content-Type':'application/json'});res.end(JSON.stringify(failMail?{error:'test failure'}:{id:'mock-email'}));});
   await new Promise(r=>mailServer.listen(0,'127.0.0.1',r));
   child=spawn(process.execPath,['server.mjs'],{env:{...process.env,PORT:'0',DATA_DIR:dir,NODE_ENV:'test',APP_URL:'https://app.example.test/',MAIL_TEST_URL:`http://127.0.0.1:${mailServer.address().port}`,MAIL_FROM:'accounts@example.test'},stdio:['ignore','pipe','pipe']});
@@ -47,6 +50,26 @@ test('private files and unsupported requests cannot be served',async()=>{
   assert.equal((await fetch(base+'/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:'{'})).status,400);
   const home=await fetch(base);assert.equal(home.status,200);assert.match(home.headers.get('content-security-policy'),/object-src 'none'/);
   assert.equal((await fetch(base+'/Vazirmatn.woff2')).status,200);
+});
+test('profile edits persist, legacy accounts migrate and private routes require the owner session',async()=>{
+  assert.equal((await fetch(base+'/api/profile')).status,401);
+  assert.equal((await post('profile',{name:'Guest',bio:''})).status,401);
+  const credentials={email:'legacy@example.test',password:'legacy-test-password'};
+  const login=await post('login',credentials);assert.equal(login.status,200);
+  const cookie=login.headers.get('set-cookie').split(';')[0];assert.equal((await login.json()).user.bio,'');
+  const other=await post('login',{email:'second@example.test',password:'unique-test-password-2026'});const otherCookie=other.headers.get('set-cookie').split(';')[0];const otherUser=(await other.json()).user;
+  const edited={name:'  نام تازهٔ من  ',bio:'طراح برند\nعلاقه‌مند به ایده‌های تازه'};
+  assert.equal((await post('profile',{...edited,id:otherUser.id,email:otherUser.email,password:'replacement-password',role:'admin'},cookie,{Origin:'https://untrusted.example'})).status,403);
+  const saved=await post('profile',{...edited,id:otherUser.id,email:otherUser.email,password:'replacement-password',role:'admin'},cookie);assert.equal(saved.status,200);
+  assert.deepEqual((await saved.json()).user,{id:'legacy-user',name:edited.name.trim(),email:credentials.email,bio:edited.bio});
+  assert.equal((await(await fetch(base+'/api/profile',{headers:{Cookie:otherCookie}})).json()).user.name,otherUser.name);
+  for(const invalid of [{name:' ',bio:''},{name:'a'.repeat(81),bio:''},{name:'A\nB',bio:''},{name:'Valid',bio:'a'.repeat(301)},{name:'Valid',bio:{}}])assert.equal((await post('profile',invalid,cookie)).status,400);
+  assert.equal((await(await fetch(base+'/api/profile',{headers:{Cookie:cookie}})).json()).user.name,edited.name.trim());
+  await post('logout',{},cookie);assert.equal((await fetch(base+'/api/profile',{headers:{Cookie:cookie}})).status,401);assert.equal((await post('profile',{name:'After logout',bio:''},cookie)).status,401);
+  const relogin=await post('login',credentials),freshCookie=relogin.headers.get('set-cookie').split(';')[0];const persisted=(await relogin.json()).user;assert.equal(persisted.name,edited.name.trim());assert.equal(persisted.bio,edited.bio);assert.equal(persisted.password,undefined);
+  const db=new DatabaseSync(join(dir,'mehrad.sqlite'));assert.equal(db.prepare('SELECT bio FROM users WHERE id=?').get('legacy-user').bio,edited.bio);
+  db.prepare('UPDATE sessions SET expires=0 WHERE token=?').run(createHash('sha256').update(freshCookie.split('=')[1]).digest('hex'));db.close();
+  assert.equal((await fetch(base+'/api/profile',{headers:{Cookie:freshCookie}})).status,401);assert.equal((await post('profile',{name:'Expired',bio:''},freshCookie)).status,401);
 });
 test('signup notifications and private, expiring, one-use password recovery',async()=>{
   const credentials={name:'Recovery User',email:'recover@example.test',password:'old-test-password-2026'};

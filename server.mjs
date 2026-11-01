@@ -18,7 +18,9 @@ CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,user_id TEXT REFERENC
 CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),name TEXT NOT NULL,description TEXT NOT NULL,style TEXT NOT NULL,palette TEXT NOT NULL,variant INTEGER NOT NULL,createdAt TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS password_resets(token TEXT PRIMARY KEY,user_id TEXT NOT NULL UNIQUE REFERENCES users(id),expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS signup_mail(id TEXT PRIMARY KEY,user_id TEXT NOT NULL UNIQUE REFERENCES users(id),createdAt TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,nextAttempt INTEGER NOT NULL DEFAULT 0);`);
-const publicUser=u=>u?{id:u.id,name:u.name,email:u.email}:null;
+// Additive migration keeps accounts created before phase 4 intact.
+if(!db.prepare('PRAGMA table_info(users)').all().some(column=>column.name==='bio'))db.exec("ALTER TABLE users ADD COLUMN bio TEXT NOT NULL DEFAULT ''");
+const publicUser=u=>u?{id:u.id,name:u.name,email:u.email,bio:u.bio||''}:null;
 const production=process.env.NODE_ENV==='production';
 const mailer=createMailer();
 const adminEmail='hesam67mk@gmail.com';
@@ -76,6 +78,16 @@ export const server=http.createServer(async(req,res)=>{
       if(path==='health'&&req.method==='GET')return json(res,200,{ok:true});
       const user=sessionUser(req);
       if(path==='session'&&req.method==='GET')return json(res,200,{service:'mehrad-ai',user:publicUser(user),features:{passwordReset:resetEnabled}});
+      if(path==='profile'){
+        if(!user)return json(res,401,{error:'برای مدیریت پروفایل وارد حساب شوید.'});
+        if(req.method==='GET')return json(res,200,{user:publicUser(user)});
+        const b=await body(req);
+        if(!validString(b.name,1,80)||/[\x00-\x1f\x7f]/.test(b.name))return json(res,400,{error:'نام نمایشی باید ۱ تا ۸۰ کاراکتر و بدون خط جدید باشد.'});
+        if(typeof b.bio!=='string'||b.bio.length>300||/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(b.bio))return json(res,400,{error:'معرفی کوتاه باید حداکثر ۳۰۰ کاراکتر باشد.'});
+        // Never accept an account ID, role, password or email from this form.
+        db.prepare('UPDATE users SET name=?,bio=? WHERE id=?').run(b.name.trim(),b.bio.trim(),user.id);
+        return json(res,200,{user:publicUser(db.prepare('SELECT * FROM users WHERE id=?').get(user.id))});
+      }
       if(path==='forgot-password'&&req.method==='POST'){
         if(!limit(req,path))return json(res,429,{error:'درخواست‌های زیادی ثبت شده. ۱۵ دقیقه دیگر تلاش کنید.'});
         if(!resetEnabled)return json(res,503,{error:'ارسال ایمیل بازیابی هنوز پیکربندی نشده است. با پشتیبانی تماس بگیرید.'});
@@ -125,12 +137,12 @@ export const server=http.createServer(async(req,res)=>{
           const salt=randomBytes(16).toString('hex');const hash=(await scrypt(b.password,salt,64)).toString('hex');const id=randomUUID();
           try{
             db.exec('BEGIN IMMEDIATE');
-            db.prepare('INSERT INTO users VALUES(?,?,?,?)').run(id,b.name.trim(),email,`${salt}:${hash}`);
+            db.prepare('INSERT INTO users(id,name,email,password) VALUES(?,?,?,?)').run(id,b.name.trim(),email,`${salt}:${hash}`);
             db.prepare('INSERT INTO signup_mail(id,user_id,createdAt) VALUES(?,?,?)').run(randomUUID(),id,new Date().toISOString());
             db.exec('COMMIT');
           }catch(e){db.exec('ROLLBACK');if(e.code?.includes('CONSTRAINT')||String(e.message).includes('UNIQUE'))return json(res,409,{error:'این ایمیل قبلاً ثبت شده است.'});throw e;}
           void deliverSignupMail();
-          loginCookie(res,id);return json(res,201,{user:{id,name:b.name.trim(),email}});
+          loginCookie(res,id);return json(res,201,{user:{id,name:b.name.trim(),email,bio:''}});
         }
         const found=db.prepare('SELECT * FROM users WHERE email=?').get(email);const [salt,stored]=found?found.password.split(':'):['00000000000000000000000000000000','00'.repeat(64)];const hash=await scrypt(b.password,salt,64);
         if(!found||!timingSafeEqual(hash,Buffer.from(stored,'hex'))||db.prepare('SELECT password FROM users WHERE id=?').get(found.id)?.password!==found.password)return json(res,401,{error:'ایمیل یا رمز عبور درست نیست.'});
