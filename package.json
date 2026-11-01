@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node server.mjs",
     "preview": "node preview.mjs",
-    "test": "node --test api.test.mjs",
-    "check": "node --check server.mjs && node --check studio.js && node --check logo.js && node --check mail.mjs"
+    "test": "node --test api.test.mjs profile.test.mjs",
+    "check": "node --check server.mjs && node --check studio.js && node --check logo.js && node --check mail.mjs && node --check profile-store.js"
   }
 }

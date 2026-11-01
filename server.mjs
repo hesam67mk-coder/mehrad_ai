@@ -162,7 +162,7 @@ export const server=http.createServer(async(req,res)=>{
     }
     if(!['GET','HEAD'].includes(req.method)){res.writeHead(405);return res.end();}
     let path;try{path=decodeURIComponent(url.pathname);}catch{res.writeHead(400);return res.end();}
-    const allowed=['/index.html','/styles.css','/studio.js','/logo.js','/brand.png','/Vazirmatn.woff2','/design-reference.html'];
+    const allowed=['/index.html','/styles.css','/studio.js','/profile-store.js','/logo.js','/brand.png','/Vazirmatn.woff2','/design-reference.html'];
     if(path==='/')path='/index.html';
     if(!allowed.includes(path)){res.writeHead(404);return res.end('Not found');}
     const file=resolve(root,`.${path}`);

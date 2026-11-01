@@ -50,6 +50,7 @@ test('private files and unsupported requests cannot be served',async()=>{
   assert.equal((await fetch(base+'/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:'{'})).status,400);
   const home=await fetch(base);assert.equal(home.status,200);assert.match(home.headers.get('content-security-policy'),/object-src 'none'/);
   assert.equal((await fetch(base+'/Vazirmatn.woff2')).status,200);
+  const profileModule=await fetch(base+'/profile-store.js');assert.equal(profileModule.status,200);assert.match(profileModule.headers.get('content-type'),/javascript/);
 });
 test('profile edits persist, legacy accounts migrate and private routes require the owner session',async()=>{
   assert.equal((await fetch(base+'/api/profile')).status,401);
