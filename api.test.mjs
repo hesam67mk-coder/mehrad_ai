@@ -18,7 +18,7 @@ before(async()=>{
   const salt='legacy-migration-test-salt';legacy.prepare('INSERT INTO users VALUES(?,?,?,?)').run('legacy-user','Legacy User','legacy@example.test',`${salt}:${scryptSync('legacy-test-password',salt,64).toString('hex')}`);legacy.close();
   mailServer=http.createServer(async(req,res)=>{let text='';for await(const chunk of req)text+=chunk;messages.push({body:JSON.parse(text),key:req.headers['idempotency-key']});res.writeHead(failMail?503:200,{'Content-Type':'application/json'});res.end(JSON.stringify(failMail?{error:'test failure'}:{id:'mock-email'}));});
   await new Promise(r=>mailServer.listen(0,'127.0.0.1',r));
-  child=spawn(process.execPath,['server.mjs'],{env:{...process.env,PORT:'0',DATA_DIR:dir,NODE_ENV:'test',APP_URL:'https://app.example.test/',MAIL_TEST_URL:`http://127.0.0.1:${mailServer.address().port}`,MAIL_FROM:'accounts@example.test'},stdio:['ignore','pipe','pipe']});
+  child=spawn(process.execPath,['server.mjs'],{env:{...process.env,PORT:'0',DATA_DIR:dir,NODE_ENV:'test',APP_URL:'',RENDER_EXTERNAL_URL:'https://app.example.test/',MAIL_TEST_URL:`http://127.0.0.1:${mailServer.address().port}`,MAIL_FROM:'accounts@example.test'},stdio:['ignore','pipe','pipe']});
   base=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Server timeout')),10000);child.stdout.on('data',b=>{const m=b.toString().match(/http:\/\/localhost:(\d+)/);if(m){clearTimeout(timer);resolve(`http://127.0.0.1:${m[1]}`);}});child.on('error',reject);child.on('exit',code=>reject(Error(`Server exited: ${code}`)));});
 });
 after(async()=>{if(child&&!child.killed){const done=once(child,'exit');child.kill();await done;}if(mailServer)await new Promise(r=>mailServer.close(r));if(dir)await rm(dir,{recursive:true,force:true});});

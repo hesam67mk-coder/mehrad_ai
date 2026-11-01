@@ -25,8 +25,9 @@ const production=process.env.NODE_ENV==='production';
 const mailer=createMailer();
 const adminEmail='hesam67mk@gmail.com';
 let appURL=null;
-if(process.env.APP_URL){
-  appURL=new URL(process.env.APP_URL);
+const configuredAppURL=process.env.APP_URL||process.env.RENDER_EXTERNAL_URL;
+if(configuredAppURL){
+  appURL=new URL(configuredAppURL);
   if(appURL.username||appURL.password||appURL.search||appURL.hash||!['http:','https:'].includes(appURL.protocol)||(production&&appURL.protocol!=='https:'))throw Error('APP_URL must be a public HTTPS app URL');
 }
 const resetEnabled=Boolean(mailer.configured&&appURL);
