@@ -6,6 +6,7 @@ import {randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual, crea
 import {promisify} from 'node:util';
 import {DatabaseSync} from 'node:sqlite';
 import {palettes} from './logo.js';
+import {createMailer} from './mail.mjs';
 const scrypt=promisify(scryptCallback);
 const root=fileURLToPath(new URL('.',import.meta.url));
 const dataDir=resolve(process.env.DATA_DIR||resolve(root,'data'));
@@ -14,9 +15,39 @@ const db=new DatabaseSync(resolve(dataDir,'mehrad.sqlite'));
 db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;');
 db.exec(`CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT NOT NULL,email TEXT NOT NULL UNIQUE,password TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,user_id TEXT REFERENCES users(id),expires INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),name TEXT NOT NULL,description TEXT NOT NULL,style TEXT NOT NULL,palette TEXT NOT NULL,variant INTEGER NOT NULL,createdAt TEXT NOT NULL);`);
+CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),name TEXT NOT NULL,description TEXT NOT NULL,style TEXT NOT NULL,palette TEXT NOT NULL,variant INTEGER NOT NULL,createdAt TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS password_resets(token TEXT PRIMARY KEY,user_id TEXT NOT NULL UNIQUE REFERENCES users(id),expires INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS signup_mail(id TEXT PRIMARY KEY,user_id TEXT NOT NULL UNIQUE REFERENCES users(id),createdAt TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,nextAttempt INTEGER NOT NULL DEFAULT 0);`);
 const publicUser=u=>u?{id:u.id,name:u.name,email:u.email}:null;
 const production=process.env.NODE_ENV==='production';
+const mailer=createMailer();
+const adminEmail='hesam67mk@gmail.com';
+let appURL=null;
+if(process.env.APP_URL){
+  appURL=new URL(process.env.APP_URL);
+  if(appURL.username||appURL.password||appURL.search||appURL.hash||!['http:','https:'].includes(appURL.protocol)||(production&&appURL.protocol!=='https:'))throw Error('APP_URL must be a public HTTPS app URL');
+}
+const resetEnabled=Boolean(mailer.configured&&appURL);
+let mailBusy=false;
+async function deliverSignupMail(){
+  if(mailBusy||!mailer.configured)return;
+  mailBusy=true;
+  try{
+    const jobs=db.prepare('SELECT signup_mail.*,users.name,users.email FROM signup_mail JOIN users ON users.id=signup_mail.user_id WHERE nextAttempt<=? ORDER BY createdAt LIMIT 10').all(Date.now());
+    for(const job of jobs){
+      try{
+        await mailer.send({to:[adminEmail],subject:'ثبت‌نام جدید در مهراد AI',text:`کاربر جدید ثبت‌نام کرد.\nنام: ${job.name}\nایمیل: ${job.email}\nزمان ثبت‌نام (UTC): ${job.createdAt}\n\nرمز عبور و لینک بازیابی در این اعلان ارسال نمی‌شوند.`},`signup/${job.id}`);
+        db.prepare('DELETE FROM signup_mail WHERE id=?').run(job.id);
+      }catch{
+        db.prepare('UPDATE signup_mail SET attempts=attempts+1,nextAttempt=? WHERE id=?').run(Date.now()+Math.min(3600000,30000*2**Math.min(job.attempts,7)),job.id);
+        console.warn('Signup notification pending; mail service unavailable.');
+      }
+    }
+  }finally{mailBusy=false;}
+}
+const mailWorker=setInterval(()=>void deliverSignupMail(),30000);mailWorker.unref();
+if(!mailer.configured)console.warn('Email delivery is not configured. Signup notifications will remain queued.');
+void deliverSignupMail();
 const rates=new Map();
 const tokenHash=t=>createHash('sha256').update(t).digest('hex');
 const cookieToken=req=>(req.headers.cookie||'').split(';').map(x=>x.trim()).find(x=>x.startsWith('mehrad_session='))?.slice(15)||'';
@@ -24,12 +55,12 @@ function sessionUser(req){const token=cookieToken(req);if(!/^[a-f0-9]{64}$/.test
 function json(res,status,data){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(data));}
 function loginCookie(res,id){const token=randomBytes(32).toString('hex');db.prepare('DELETE FROM sessions WHERE expires < ?').run(Date.now());db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(tokenHash(token),id,Date.now()+7*86400000);res.setHeader('Set-Cookie',`mehrad_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800${production?'; Secure':''}`);}
 function validString(value,min,max){return typeof value==='string'&&value.trim().length>=min&&value.length<=max;}
-function limit(req,path){const key=`${req.socket.remoteAddress}:${path}`;const now=Date.now();let item=rates.get(key);if(!item||item.until<now){item={count:0,until:now+900000};rates.set(key,item);}item.count++;return item.count<=(path==='login'?30:10);}
+function limit(req,path,identity=''){const key=identity?`identity:${path}:${tokenHash(identity)}`:`${req.socket.remoteAddress}:${path}`;const now=Date.now();let item=rates.get(key);if(!item||item.until<now){item={count:0,until:now+900000};rates.set(key,item);}item.count++;return item.count<=(path==='login'?30:10);}
 const cleaner=setInterval(()=>{for(const [key,value]of rates)if(value.until<Date.now())rates.delete(key);},60000);cleaner.unref();
 async function body(req){let text='';for await(const chunk of req){text+=chunk;if(Buffer.byteLength(text)>16384)throw Object.assign(Error('درخواست بیش از حد بزرگ است.'),{status:413});}try{const result=JSON.parse(text||'{}');if(!result||Array.isArray(result)||typeof result!=='object')throw Error();return result;}catch{throw Object.assign(Error('ساختار درخواست معتبر نیست.'),{status:400});}}
 const mime={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.png':'image/png','.jpg':'image/jpeg','.woff2':'font/woff2','.svg':'image/svg+xml'};
 export const server=http.createServer(async(req,res)=>{
-  res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','same-origin');res.setHeader('X-Frame-Options','DENY');
+  res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('X-Frame-Options','DENY');
   res.setHeader('Content-Security-Policy',`default-src 'self'; script-src 'self'${req.url?.split('?')[0]==='/design-reference.html'?" 'unsafe-inline'":''}; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self' data: https://cdn.jsdelivr.net; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`);
   try{
     const url=new URL(req.url,'http://localhost');
@@ -44,20 +75,65 @@ export const server=http.createServer(async(req,res)=>{
       }
       if(path==='health'&&req.method==='GET')return json(res,200,{ok:true});
       const user=sessionUser(req);
-      if(path==='session'&&req.method==='GET')return json(res,200,{service:'mehrad-ai',user:publicUser(user)});
+      if(path==='session'&&req.method==='GET')return json(res,200,{service:'mehrad-ai',user:publicUser(user),features:{passwordReset:resetEnabled}});
+      if(path==='forgot-password'&&req.method==='POST'){
+        if(!limit(req,path))return json(res,429,{error:'درخواست‌های زیادی ثبت شده. ۱۵ دقیقه دیگر تلاش کنید.'});
+        if(!resetEnabled)return json(res,503,{error:'ارسال ایمیل بازیابی هنوز پیکربندی نشده است. با پشتیبانی تماس بگیرید.'});
+        const b=await body(req);
+        if(!validString(b.email,3,254)||!/^\S+@\S+\.\S+$/.test(b.email.trim()))return json(res,400,{error:'ایمیل معتبر وارد کنید.'});
+        const email=b.email.trim().toLowerCase();
+        const message='اگر حسابی با این ایمیل وجود داشته باشد، لینک بازیابی برای آن ارسال می‌شود. صندوق ورودی و پوشهٔ هرزنامه را بررسی کنید.';
+        json(res,202,{message});
+        // Uniform response for known and unknown addresses; never return reset tokens.
+        if(!limit(req,'reset-email',email))return;
+        const found=db.prepare('SELECT id,email FROM users WHERE email=?').get(email);
+        if(!found)return;
+        const token=randomBytes(32).toString('hex');
+        db.prepare('DELETE FROM password_resets WHERE expires<?').run(Date.now());
+        db.prepare('INSERT INTO password_resets VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET token=excluded.token,expires=excluded.expires').run(tokenHash(token),found.id,Date.now()+30*60000);
+        const link=new URL(appURL);link.hash=`reset-password?token=${token}`;
+        try{await mailer.send({to:[found.email],subject:'بازیابی رمز عبور مهراد AI',text:`برای تعیین رمز جدید، لینک زیر را باز کنید:\n${link.href}\n\nاین لینک فقط یک بار و تا ۳۰ دقیقه قابل استفاده است. اگر این درخواست را شما ثبت نکرده‌اید، ایمیل را نادیده بگیرید. رمز فعلی شما تغییر نکرده است.`},`reset/${tokenHash(token)}`);}
+        catch{db.prepare('DELETE FROM password_resets WHERE token=?').run(tokenHash(token));console.warn('Password reset email could not be sent.');}
+        return;
+      }
+      if(path==='reset-password'&&req.method==='POST'){
+        if(!limit(req,path))return json(res,429,{error:'درخواست‌های زیادی ثبت شده. ۱۵ دقیقه دیگر تلاش کنید.'});
+        const b=await body(req);
+        if(typeof b.token!=='string'||!/^[a-f0-9]{64}$/.test(b.token)||!validString(b.password,10,128))return json(res,400,{error:'لینک معتبر و رمز ۱۰ تا ۱۲۸ کاراکتری لازم است.'});
+        const hashedToken=tokenHash(b.token);
+        const reset=db.prepare('SELECT user_id FROM password_resets WHERE token=? AND expires>?').get(hashedToken,Date.now());
+        if(!reset)return json(res,400,{error:'لینک بازیابی نامعتبر یا منقضی شده است. لینک تازه درخواست کنید.'});
+        const salt=randomBytes(16).toString('hex'),hash=(await scrypt(b.password,salt,64)).toString('hex');
+        db.exec('BEGIN IMMEDIATE');
+        try{
+          const consumed=db.prepare('DELETE FROM password_resets WHERE token=? AND expires>?').run(hashedToken,Date.now());
+          if(!consumed.changes){db.exec('ROLLBACK');return json(res,400,{error:'لینک بازیابی قبلاً استفاده شده یا منقضی شده است.'});}
+          db.prepare('UPDATE users SET password=? WHERE id=?').run(`${salt}:${hash}`,reset.user_id);
+          db.prepare('DELETE FROM sessions WHERE user_id=?').run(reset.user_id);
+          db.exec('COMMIT');
+        }catch(e){db.exec('ROLLBACK');throw e;}
+        res.setHeader('Set-Cookie',`mehrad_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${production?'; Secure':''}`);
+        return json(res,200,{message:'رمز عبور تغییر کرد. با رمز جدید وارد شوید.'});
+      }
       if(['register','login'].includes(path)&&req.method==='POST'){
         if(!limit(req,path))return json(res,429,{error:'درخواست‌های زیادی ثبت شده. ۱۵ دقیقه دیگر تلاش کنید.'});
         const b=await body(req);if(!validString(b.email,3,254)||!/^\S+@\S+\.\S+$/.test(b.email)||!validString(b.password,10,128))return json(res,400,{error:'ایمیل معتبر و رمز ۱۰ تا ۱۲۸ کاراکتری وارد کنید.'});
         const email=b.email.trim().toLowerCase();
         if(path==='register'){
-          if(!validString(b.name,1,80))return json(res,400,{error:'نام معتبر وارد کنید.'});
+          if(!validString(b.name,1,80)||/[\r\n\x00-\x1f]/.test(b.name))return json(res,400,{error:'نام معتبر وارد کنید.'});
           if(db.prepare('SELECT id FROM users WHERE email=?').get(email))return json(res,409,{error:'این ایمیل قبلاً ثبت شده است.'});
           const salt=randomBytes(16).toString('hex');const hash=(await scrypt(b.password,salt,64)).toString('hex');const id=randomUUID();
-          try{db.prepare('INSERT INTO users VALUES(?,?,?,?)').run(id,b.name.trim(),email,`${salt}:${hash}`);}catch(e){if(e.code?.includes('CONSTRAINT')||String(e.message).includes('UNIQUE'))return json(res,409,{error:'این ایمیل قبلاً ثبت شده است.'});throw e;}
+          try{
+            db.exec('BEGIN IMMEDIATE');
+            db.prepare('INSERT INTO users VALUES(?,?,?,?)').run(id,b.name.trim(),email,`${salt}:${hash}`);
+            db.prepare('INSERT INTO signup_mail(id,user_id,createdAt) VALUES(?,?,?)').run(randomUUID(),id,new Date().toISOString());
+            db.exec('COMMIT');
+          }catch(e){db.exec('ROLLBACK');if(e.code?.includes('CONSTRAINT')||String(e.message).includes('UNIQUE'))return json(res,409,{error:'این ایمیل قبلاً ثبت شده است.'});throw e;}
+          void deliverSignupMail();
           loginCookie(res,id);return json(res,201,{user:{id,name:b.name.trim(),email}});
         }
         const found=db.prepare('SELECT * FROM users WHERE email=?').get(email);const [salt,stored]=found?found.password.split(':'):['00000000000000000000000000000000','00'.repeat(64)];const hash=await scrypt(b.password,salt,64);
-        if(!found||!timingSafeEqual(hash,Buffer.from(stored,'hex')))return json(res,401,{error:'ایمیل یا رمز عبور درست نیست.'});
+        if(!found||!timingSafeEqual(hash,Buffer.from(stored,'hex'))||db.prepare('SELECT password FROM users WHERE id=?').get(found.id)?.password!==found.password)return json(res,401,{error:'ایمیل یا رمز عبور درست نیست.'});
         loginCookie(res,found.id);return json(res,200,{user:publicUser(found)});
       }
       if(path==='logout'&&req.method==='POST'){db.prepare('DELETE FROM sessions WHERE token=?').run(tokenHash(cookieToken(req)));res.setHeader('Set-Cookie',`mehrad_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${production?'; Secure':''}`);return json(res,200,{ok:true});}

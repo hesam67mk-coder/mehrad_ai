@@ -6,13 +6,19 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {once} from 'node:events';
 import {logoSVG} from './logo.js';
-let child,dir,base;
+import http from 'node:http';
+import {DatabaseSync} from 'node:sqlite';
+import {createHash} from 'node:crypto';
+let child,dir,base,mailServer,messages=[],failMail=false;
+async function waitFor(check){for(let i=0;i<100;i++){if(check())return;await new Promise(r=>setTimeout(r,20));}throw Error('Timed out waiting for mail');}
 before(async()=>{
   dir=await mkdtemp(join(tmpdir(),'mehrad-test-'));
-  child=spawn(process.execPath,['server.mjs'],{env:{...process.env,PORT:'0',DATA_DIR:dir},stdio:['ignore','pipe','pipe']});
+  mailServer=http.createServer(async(req,res)=>{let text='';for await(const chunk of req)text+=chunk;messages.push({body:JSON.parse(text),key:req.headers['idempotency-key']});res.writeHead(failMail?503:200,{'Content-Type':'application/json'});res.end(JSON.stringify(failMail?{error:'test failure'}:{id:'mock-email'}));});
+  await new Promise(r=>mailServer.listen(0,'127.0.0.1',r));
+  child=spawn(process.execPath,['server.mjs'],{env:{...process.env,PORT:'0',DATA_DIR:dir,NODE_ENV:'test',APP_URL:'https://app.example.test/',MAIL_TEST_URL:`http://127.0.0.1:${mailServer.address().port}`,MAIL_FROM:'accounts@example.test'},stdio:['ignore','pipe','pipe']});
   base=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Server timeout')),10000);child.stdout.on('data',b=>{const m=b.toString().match(/http:\/\/localhost:(\d+)/);if(m){clearTimeout(timer);resolve(`http://127.0.0.1:${m[1]}`);}});child.on('error',reject);child.on('exit',code=>reject(Error(`Server exited: ${code}`)));});
 });
-after(async()=>{if(child&&!child.killed){const done=once(child,'exit');child.kill();await done;}if(dir)await rm(dir,{recursive:true,force:true});});
+after(async()=>{if(child&&!child.killed){const done=once(child,'exit');child.kill();await done;}if(mailServer)await new Promise(r=>mailServer.close(r));if(dir)await rm(dir,{recursive:true,force:true});});
 const post=(path,data,cookie,extra={})=>fetch(`${base}/api/${path}`,{method:'POST',headers:{'Content-Type':'application/json',...(cookie?{Cookie:cookie}:{}),...extra},body:JSON.stringify(data)});
 test('registration, authentication, persistence and account isolation',async()=>{
   const credentials={name:'Test User',email:'test@example.test',password:'unique-test-password-2026'};
@@ -36,11 +42,39 @@ test('registration, authentication, persistence and account isolation',async()=>
   assert.equal((await (await fetch(`${base}/api/projects`,{headers:{Cookie:newCookie}})).json()).projects.length,1);
 });
 test('private files and unsupported requests cannot be served',async()=>{
-  for(const path of ['/server.mjs','/package.json','/data/mehrad.sqlite','/.env','/assets/../server.mjs'])assert.equal((await fetch(base+path)).status,404);
+  for(const path of ['/server.mjs','/mail.mjs','/package.json','/data/mehrad.sqlite','/.env','/.env.example','/assets/../server.mjs'])assert.equal((await fetch(base+path)).status,404);
   assert.equal((await fetch(base+'/api/register',{method:'POST',headers:{'Content-Type':'text/plain'},body:'{}'})).status,415);
   assert.equal((await fetch(base+'/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:'{'})).status,400);
   const home=await fetch(base);assert.equal(home.status,200);assert.match(home.headers.get('content-security-policy'),/object-src 'none'/);
   assert.equal((await fetch(base+'/Vazirmatn.woff2')).status,200);
+});
+test('signup notifications and private, expiring, one-use password recovery',async()=>{
+  const credentials={name:'Recovery User',email:'recover@example.test',password:'old-test-password-2026'};
+  const registered=await post('register',credentials);assert.equal(registered.status,201);
+  const cookie=registered.headers.get('set-cookie').split(';')[0];
+  await waitFor(()=>messages.some(m=>m.key.startsWith('signup/')&&m.body.text.includes(credentials.email)));
+  const notice=messages.find(m=>m.key.startsWith('signup/')&&m.body.text.includes(credentials.email));
+  assert.deepEqual(notice.body.to,['hesam67mk@gmail.com']);assert.ok(notice.body.text.includes(credentials.name));assert.ok(!notice.body.text.includes(credentials.password));assert.ok(!notice.body.text.includes('reset-password?token='));
+  const session=await(await fetch(base+'/api/session')).json();assert.equal(session.features.passwordReset,true);
+  const known=await post('forgot-password',{email:'RECOVER@example.test'}),unknown=await post('forgot-password',{email:'unknown@example.test'});
+  assert.equal(known.status,202);assert.equal(unknown.status,202);assert.deepEqual(await known.json(),await unknown.json());
+  await waitFor(()=>messages.some(m=>m.key.startsWith('reset/')));
+  const resetMail=messages.filter(m=>m.key.startsWith('reset/')).at(-1);
+  assert.deepEqual(resetMail.body.to,[credentials.email]);
+  const link=new URL(resetMail.body.text.match(/https:\/\/\S+/)[0]);assert.equal(link.origin,'https://app.example.test');
+  const token=new URLSearchParams(link.hash.split('?')[1]).get('token');assert.match(token,/^[a-f0-9]{64}$/);
+  const db=new DatabaseSync(join(dir,'mehrad.sqlite'));
+  const hash=createHash('sha256').update(token).digest('hex');assert.equal(db.prepare('SELECT token FROM password_resets WHERE token=?').get(hash).token,hash);assert.equal(db.prepare('SELECT token FROM password_resets WHERE token=?').get(token),undefined);
+  assert.equal((await post('reset-password',{token,password:'short'})).status,400);
+  const newPassword='new-test-password-2026';assert.equal((await post('reset-password',{token,password:newPassword})).status,200);
+  assert.equal((await post('reset-password',{token,password:'reuse-test-password'})).status,400);
+  assert.equal((await(await fetch(base+'/api/session',{headers:{Cookie:cookie}})).json()).user,null);
+  assert.equal((await post('login',credentials)).status,401);assert.equal((await post('login',{email:credentials.email,password:newPassword})).status,200);
+  const count=messages.length;await post('forgot-password',{email:credentials.email});await waitFor(()=>messages.length>count);
+  const nextToken=new URLSearchParams(new URL(messages.at(-1).body.text.match(/https:\/\/\S+/)[0]).hash.split('?')[1]).get('token');
+  db.prepare('UPDATE password_resets SET expires=0').run();assert.equal((await post('reset-password',{token:nextToken,password:newPassword})).status,400);
+  failMail=true;const prior=messages.length;await post('forgot-password',{email:credentials.email});await waitFor(()=>messages.length>prior);await waitFor(()=>!db.prepare('SELECT token FROM password_resets').get());failMail=false;
+  db.close();
 });
 test('SVG text cannot inject executable markup',()=>{
   const svg=logoSVG({name:'<script>alert("x")</script>',variant:0},true);
